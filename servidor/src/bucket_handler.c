@@ -142,3 +142,33 @@ int anadir_archivo(const char *nombre, const char *archivo) {
     fclose(bucket);
     return BUCKET_OK;
 }
+
+int list_bucket(const char *nombre, char paths[][MAX_PATH], int *count) {
+
+    // Extraer esto a funcion aparte, primero ver como queda el resto
+    if (existe_bucket(nombre) != 0) {
+        return BUCKET_NOT_FOUND;
+    }
+
+    char bucket_path[MAX_PATH];
+    snprintf(bucket_path, sizeof(bucket_path), "buckets/%s", nombre);
+    FILE *bucket = fopen(bucket_path, "rb");
+    if (bucket == NULL) {
+        return BUCKET_ERROR;
+    }
+
+    BloqueDirectorio dir;
+    if (fread(&dir, sizeof(BloqueDirectorio), 1, bucket) != 1) {
+        fclose(bucket);
+        return BUCKET_ERROR;
+    }
+
+    for (uint32_t i = 0; i < dir.cantidad_archivos; i++) {
+        strncpy(paths[i], dir.files[i].path, MAX_PATH - 1);
+        paths[i][MAX_PATH - 1] = '\0';
+    }
+
+    *count = (int)dir.cantidad_archivos;
+    fclose(bucket);
+    return BUCKET_OK;
+}

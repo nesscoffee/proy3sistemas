@@ -33,3 +33,4 @@ typedef enum {
 int crear_bucket(const char *nombre);
 int existe_bucket(const char *nombre);
 int anadir_archivo(const char *nombre, const char *archivo);
+int list_bucket(const char *nombre, char paths[][MAX_PATH], int *count);
