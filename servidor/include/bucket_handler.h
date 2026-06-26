@@ -25,7 +25,11 @@ typedef struct {
 typedef enum {
     BUCKET_OK = 0,
     BUCKET_ALREADY_EXISTS = -1,
-    BUCKET_ERROR = -2
+    BUCKET_ERROR = -2,
+    BUCKET_NOT_FOUND = -3,
+    BUCKET_FULL = -4
 } BucketStatus;
 
-int crear_bucket(char *nombre);
+int crear_bucket(const char *nombre);
+int existe_bucket(const char *nombre);
+int anadir_archivo(const char *nombre, const char *archivo);
