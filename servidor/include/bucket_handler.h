@@ -1,36 +1,41 @@
 #pragma once
 
 #include <stdint.h>
-#define MAX_PATH 256
-#define MAX_FILES 100
+#include <stddef.h>
+
+#define MAX_RUTA 256
+#define MAX_ARCHIVOS 100
 
 typedef struct {
-    char     path[MAX_PATH];
-    uint32_t size;
+    char     ruta[MAX_RUTA];
+    uint32_t tamano;
     uint32_t offset;
 } ArchivoMetadata;
 
 typedef struct {
     uint32_t offset;
-    uint32_t size;
+    uint32_t tamano;
 } EspacioLibre;
 
 typedef struct {
-    ArchivoMetadata files[MAX_FILES];
-    EspacioLibre    espacios_libres[MAX_FILES];
-    uint32_t        cantidad_archivos;
-    uint32_t        cantidad_huecos;
+    ArchivoMetadata archivos[MAX_ARCHIVOS];
+    EspacioLibre    espaciosLibres[MAX_ARCHIVOS];
+    uint32_t        cantidadArchivos;
+    uint32_t        cantidadHuecos;
 } BloqueDirectorio;
 
 typedef enum {
     BUCKET_OK = 0,
-    BUCKET_ALREADY_EXISTS = -1,
+    BUCKET_YA_EXISTE = -1,
     BUCKET_ERROR = -2,
-    BUCKET_NOT_FOUND = -3,
-    BUCKET_FULL = -4
-} BucketStatus;
+    BUCKET_NO_ENCONTRADO = -3,
+    BUCKET_LLENO = -4
+} EstadoBucket;
 
-int crear_bucket(const char *nombre);
-int existe_bucket(const char *nombre);
-int anadir_archivo(const char *nombre, const char *archivo);
-int list_bucket(const char *nombre, char paths[][MAX_PATH], int *count);
+int crearBucket(const char* nombre);
+int existeBucket(const char* nombre);
+int subirArchivo(const char* bucket, const char* clave, const void* datos, uint32_t tamano);
+int descargarArchivo(const char* bucket, const char* clave, void** datos, uint32_t* tamano);
+int eliminarArchivo(const char* bucket, const char* clave, int recursivo);
+int eliminarBucket(const char* nombre, int forzar);
+int listarContenido(const char* bucket, const char* prefijo, char* salida, size_t* tamSalida);
