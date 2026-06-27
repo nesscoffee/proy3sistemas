@@ -122,7 +122,7 @@ static int lsCmd(int argc, char* argv[]) {
     int indiceArgs[2], nArgs = 0;
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--recursivo") == 0) continue;
+        if (strcmp(argv[i], "--recursive") == 0) continue;
         if (nArgs < 2) indiceArgs[nArgs++] = i;
     }
 
@@ -334,19 +334,19 @@ static int mvCmd(int argc, char* argv[]) {
 }
 
 static int rmCmd(int argc, char* argv[]) {
-    if (argc < 3) { fprintf(stderr, "Uso: %s rm <bucket> <clave> [--recursivo]\n", argv[0]); return 1; }
-    if (argc < 4) { fprintf(stderr, "Uso: %s rm <bucket> <clave> [--recursivo]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "Uso: %s rm <bucket> <clave> [--recursive]\n", argv[0]); return 1; }
+    if (argc < 4) { fprintf(stderr, "Uso: %s rm <bucket> <clave> [--recursive]\n", argv[0]); return 1; }
 
-    int flagRecursivo = 0;
+    int flagrecursive = 0;
     for (int i = 4; i < argc; i++)
-        if (strcmp(argv[i], "--recursivo") == 0) flagRecursivo = 1;
+        if (strcmp(argv[i], "--recursive") == 0) flagrecursive = 1;
 
     int sock = conectarServidor();
     if (sock < 0) return 1;
 
     char cmd[TAM_BUF];
-    if (flagRecursivo)
-        snprintf(cmd, sizeof(cmd), "RM %s %s RECURSIVO\n", argv[2], argv[3]);
+    if (flagrecursive)
+        snprintf(cmd, sizeof(cmd), "RM %s %s recursive\n", argv[2], argv[3]);
     else
         snprintf(cmd, sizeof(cmd), "RM %s %s\n", argv[2], argv[3]);
 

@@ -163,8 +163,8 @@ int main(void) {
                 descargarArchivoStream(arg1, arg2, cliente, &enviado);
             }
             else if (strcmp(cmd, "RM") == 0) {
-                int recursivo = (n >= 4 && strcmp(arg3, "RECURSIVO") == 0) ? 1 : 0;
-                int res = eliminarArchivo(arg1, arg2, recursivo);
+                int recursive = (n >= 4 && strcmp(arg3, "RECURSIVE") == 0) ? 1 : 0;
+                int res = eliminarArchivo(arg1, arg2, recursive);
                 if (res == BUCKET_OK)                 enviarRespuesta(cliente, "OK\n");
                 else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Archivo no encontrado\n");
                 else                                  enviarRespuesta(cliente, "ERROR: No se pudo eliminar\n");
