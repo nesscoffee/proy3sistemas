@@ -7,7 +7,6 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include <errno.h>
 
 #define PUERTO 9000
 #define SERVIDOR "127.0.0.1"
@@ -218,33 +217,35 @@ static int cpCmd(int argc, char* argv[]) {
         close(sock);
     }
     else if (!esS3Orig && esS3Dest) {
-        // Upload local -> S3
+        // Upload local -> S3  (streaming: no carga el archivo entero en memoria)
+        struct stat st;
+        if (stat(argv[2], &st) != 0) { perror(argv[2]); return 1; }
+        long tam = st.st_size;
+
         FILE* f = fopen(argv[2], "rb");
         if (!f) { perror(argv[2]); return 1; }
-
-        fseek(f, 0, SEEK_END);
-        long tam = ftell(f);
-        if (tam < 0) { fclose(f); return 1; }
-        rewind(f);
-
-        void* datos = malloc((size_t)tam);
-        if (!datos) { fclose(f); return 1; }
-        if (fread(datos, 1, (size_t)tam, f) != (size_t)tam) {
-            free(datos); fclose(f); return 1;
-        }
-        fclose(f);
 
         char bucket[TAM_BUF], clave[TAM_BUF];
         parsearRutaS3(argv[3], bucket, sizeof(bucket), clave, sizeof(clave));
 
         int sock = conectarServidor();
-        if (sock < 0) { free(datos); return 1; }
+        if (sock < 0) { fclose(f); return 1; }
 
+        /* Enviar cabecera */
         char cmd[TAM_BUF];
         snprintf(cmd, sizeof(cmd), "PUT %s %s %ld\n", bucket, clave, tam);
         enviarTodo(sock, cmd, strlen(cmd));
-        enviarTodo(sock, datos, (size_t)tam);
-        free(datos);
+
+        /* Enviar cuerpo en chunks */
+        char chunk[TAM_BUF];
+        size_t leido;
+        while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+            if (enviarTodo(sock, chunk, leido) < 0) {
+                fprintf(stderr, "Error enviando datos\n");
+                fclose(f); close(sock); return 1;
+            }
+        }
+        fclose(f);
 
         char resp[TAM_BUF];
         leerLinea(sock, resp, sizeof(resp));
@@ -271,27 +272,30 @@ static int cpCmd(int argc, char* argv[]) {
             return 1;
         }
 
+        // Descargar en streaming: escribir directamente al archivo de destino
         uint32_t tamDatos = (uint32_t)atol(resp + 3);
-        void* datos = malloc(tamDatos);
-        if (!datos) { close(sock); return 1; }
-
-        size_t leido = 0;
-        while (leido < tamDatos) {
-            int r = (int)read(sock, (char*)datos + leido, tamDatos - leido);
-            if (r <= 0) break;
-            leido += (size_t)r;
-        }
-
-        close(sock);
-
-        if (leido != tamDatos) { free(datos); fprintf(stderr, "Error: datos incompletos\n"); return 1; }
 
         FILE* f = fopen(argv[3], "wb");
-        if (!f) { perror(argv[3]); free(datos); return 1; }
-        fwrite(datos, 1, tamDatos, f);
-        fclose(f);
-        free(datos);
+        if (!f) { perror(argv[3]); close(sock); return 1; }
 
+        char chunk[TAM_BUF];
+        uint32_t pendiente = tamDatos;
+        int errorStream = 0;
+        while (pendiente > 0) {
+            uint32_t bloque = (pendiente < TAM_BUF) ? pendiente : TAM_BUF;
+            int r = (int)read(sock, chunk, bloque);
+            if (r <= 0) { errorStream = 1; break; }
+            if (fwrite(chunk, 1, (size_t)r, f) != (size_t)r) { errorStream = 1; break; }
+            pendiente -= (uint32_t)r;
+        }
+        fclose(f);
+        close(sock);
+
+        if (errorStream) {
+            fprintf(stderr, "Error: transferencia incompleta\n");
+            remove(argv[3]);   /* eliminar archivo parcial */
+            return 1;
+        }
         printf("OK\n");
     }
     else {
@@ -415,29 +419,32 @@ static int syncCmd(int argc, char* argv[]) {
             }
 
             if (!encontrado) {
-                // Read local file
+                // Read local file and stream it
                 char rutaLocal[4096];
                 snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", argv[2], archivosLocales[i]);
+
+                struct stat stArch;
+                if (stat(rutaLocal, &stArch) != 0) continue;
+                long tamArch = stArch.st_size;
 
                 FILE* f = fopen(rutaLocal, "rb");
                 if (!f) continue;
 
-                fseek(f, 0, SEEK_END);
-                long tamArch = ftell(f);
-                if (tamArch < 0) { fclose(f); continue; }
-                rewind(f);
-
-                void* datos = malloc((size_t)tamArch);
-                if (!datos) { fclose(f); continue; }
-                fread(datos, 1, (size_t)tamArch, f);
-                fclose(f);
-
-                // Send PUT
+                // Send PUT header
                 char cmdPut[TAM_BUF];
                 snprintf(cmdPut, sizeof(cmdPut), "PUT %s %s %ld\n", bucket, claveS3, tamArch);
                 enviarTodo(sock, cmdPut, strlen(cmdPut));
-                enviarTodo(sock, datos, (size_t)tamArch);
-                free(datos);
+
+                // Stream body in chunks
+                char chunk[TAM_BUF];
+                size_t leido;
+                int errorUp = 0;
+                while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+                    if (enviarTodo(sock, chunk, leido) < 0) { errorUp = 1; break; }
+                }
+                fclose(f);
+
+                if (errorUp) { printf("ERROR %s: fallo de red\n", claveS3); continue; }
 
                 char resp[TAM_BUF];
                 leerLinea(sock, resp, sizeof(resp));
@@ -529,34 +536,29 @@ static int syncCmd(int argc, char* argv[]) {
                 }
 
                 uint32_t tamDatos = (uint32_t)atol(resp + 3);
-                void* datos = malloc(tamDatos);
-                if (!datos) continue;
-
-                size_t leido = 0;
-                while (leido < tamDatos) {
-                    int r = (int)read(sock, (char*)datos + leido, tamDatos - leido);
-                    if (r <= 0) break;
-                    leido += (size_t)r;
-                }
-
-                if (leido != tamDatos) { free(datos); continue; }
 
                 // Create parent directories
                 for (char* p = rutaLocal + 1; *p; p++) {
-                    if (*p == '/') {
-                        *p = '\0';
-                        mkdir(rutaLocal, 0755);
-                        *p = '/';
-                    }
+                    if (*p == '/') { *p = '\0'; mkdir(rutaLocal, 0755); *p = '/'; }
                 }
 
                 FILE* f = fopen(rutaLocal, "wb");
-                if (f) {
-                    fwrite(datos, 1, tamDatos, f);
-                    fclose(f);
-                    printf("DESCARGADO %s\n", archivosRemotos[j]);
+                if (!f) continue;
+
+                char chunk[TAM_BUF];
+                uint32_t pendiente = tamDatos;
+                int errorDown = 0;
+                while (pendiente > 0) {
+                    uint32_t bloque = (pendiente < TAM_BUF) ? pendiente : TAM_BUF;
+                    int r = (int)read(sock, chunk, bloque);
+                    if (r <= 0) { errorDown = 1; break; }
+                    fwrite(chunk, 1, (size_t)r, f);
+                    pendiente -= (uint32_t)r;
                 }
-                free(datos);
+                fclose(f);
+
+                if (errorDown) { remove(rutaLocal); continue; }
+                printf("DESCARGADO %s\n", archivosRemotos[j]);
             }
         }
 

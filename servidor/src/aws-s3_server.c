@@ -6,10 +6,37 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "bucket_handler.h"
+#include "../include/bucket_handler.h"
 
-#define PORT 9000
+#define PORT    9000
 #define TAM_BUF 4096
+
+/*
+ * copiarEntreLocalBuckets – copia un objeto entre dos buckets locales
+ * usando un pipe anónimo. Evita cargar el archivo completo en memoria:
+ * descargarArchivoStream escribe en el extremo de escritura del pipe,
+ * y luego subirArchivoStream lee desde el extremo de lectura.
+ *
+ * Nota: pipe tiene un buffer del kernel (~64 KB en Linux). Para los
+ * tamaños de archivo razonables de este proyecto es suficiente.
+ * Si se necesitaran archivos mayores, la alternativa sin librerías
+ * externas sería un archivo temporal en /tmp.
+ */
+static int copiarEntreLocalBuckets(const char* bOrig, const char* cOrig,
+                                   const char* bDest, const char* cDest) {
+    int fds[2];
+    if (pipe(fds) < 0) return BUCKET_ERROR;
+
+    uint32_t tamano = 0;
+    int res = descargarArchivoStream(bOrig, cOrig, fds[1], &tamano);
+    close(fds[1]);  /* señalar EOF al extremo de lectura */
+
+    if (res != BUCKET_OK) { close(fds[0]); return res; }
+
+    res = subirArchivoStream(bDest, cDest, fds[0], tamano);
+    close(fds[0]);
+    return res;
+}
 
 static int crearSocket(void) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -104,98 +131,60 @@ int main(void) {
                     enviarRespuesta(cliente, "ERROR: Bucket no encontrado\n");
             }
             else if (strcmp(cmd, "PUT") == 0) {
+                /* Protocolo: PUT <bucket> <clave> <tamano>\n<bytes...>
+                 * Lee directamente desde el socket sin pasar por memoria. */
                 if (n < 4) { enviarRespuesta(cliente, "ERROR: Argumentos insuficientes\n"); continue; }
 
                 uint32_t tamDatos = (uint32_t)atol(arg3);
-                void* datos = malloc(tamDatos);
-                if (!datos) { enviarRespuesta(cliente, "ERROR: No hay memoria\n"); continue; }
+                int res = subirArchivoStream(arg1, arg2, cliente, tamDatos);
 
-                size_t leido = 0;
-                while (leido < tamDatos) {
-                    int r = (int)read(cliente, (char*)datos + leido, tamDatos - leido);
-                    if (r <= 0) break;
-                    leido += (size_t)r;
-                }
-
-                if (leido != tamDatos) {
-                    free(datos);
-                    enviarRespuesta(cliente, "ERROR: Datos incompletos\n");
+                if (res == BUCKET_OK)                 enviarRespuesta(cliente, "OK\n");
+                else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Bucket no encontrado\n");
+                else if (res == BUCKET_LLENO)         enviarRespuesta(cliente, "ERROR: Bucket lleno\n");
+                else                                  enviarRespuesta(cliente, "ERROR: No se pudo subir archivo\n");
+            }
+            else if (strcmp(cmd, "GET") == 0) {
+                /* Protocolo: GET <bucket> <clave>\n  ->  OK <tam>\n<bytes...>
+                 * Primero consultamos el tamaño para poder enviar el encabezado
+                 * antes de iniciar el stream de datos al socket. */
+                uint32_t tamDatos = 0;
+                int res = obtenerTamanoArchivo(arg1, arg2, &tamDatos);
+                if (res != BUCKET_OK) {
+                    enviarRespuesta(cliente, "ERROR: Archivo no encontrado\n");
                     continue;
                 }
 
-                int res = subirArchivo(arg1, arg2, datos, tamDatos);
-                free(datos);
+                char encabezado[64];
+                snprintf(encabezado, sizeof(encabezado), "OK %u\n", tamDatos);
+                enviarRespuesta(cliente, encabezado);
 
-                if (res == BUCKET_OK) enviarRespuesta(cliente, "OK\n");
-                else if (res == BUCKET_YA_EXISTE) enviarRespuesta(cliente, "ERROR: Bucket ya existe\n");
-                else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Bucket no encontrado\n");
-                else if (res == BUCKET_LLENO) enviarRespuesta(cliente, "ERROR: Bucket lleno\n");
-                else enviarRespuesta(cliente, "ERROR: No se pudo subir archivo\n");
-            }
-            else if (strcmp(cmd, "GET") == 0) {
-                void* datos = NULL;
-                uint32_t tamDatos = 0;
-
-                int res = descargarArchivo(arg1, arg2, &datos, &tamDatos);
-                if (res == BUCKET_OK) {
-                    char encabezado[64];
-                    snprintf(encabezado, sizeof(encabezado), "OK %u\n", tamDatos);
-                    enviarRespuesta(cliente, encabezado);
-                    size_t enviado = 0;
-                    while (enviado < tamDatos) {
-                        int r = (int)send(cliente, (char*)datos + enviado, tamDatos - enviado, 0);
-                        if (r <= 0) break;
-                        enviado += (size_t)r;
-                    }
-                    free(datos);
-                } else {
-                    enviarRespuesta(cliente, "ERROR: Archivo no encontrado\n");
-                }
+                /* Stream directo al socket: sin malloc, sin buffer intermedio */
+                uint32_t enviado = 0;
+                descargarArchivoStream(arg1, arg2, cliente, &enviado);
             }
             else if (strcmp(cmd, "RM") == 0) {
                 int recursivo = (n >= 4 && strcmp(arg3, "RECURSIVO") == 0) ? 1 : 0;
                 int res = eliminarArchivo(arg1, arg2, recursivo);
-                if (res == BUCKET_OK) enviarRespuesta(cliente, "OK\n");
+                if (res == BUCKET_OK)                 enviarRespuesta(cliente, "OK\n");
                 else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Archivo no encontrado\n");
-                else enviarRespuesta(cliente, "ERROR: No se pudo eliminar\n");
+                else                                  enviarRespuesta(cliente, "ERROR: No se pudo eliminar\n");
             }
             else if (strcmp(cmd, "CP") == 0) {
-                void* datos = NULL;
-                uint32_t tamDatos = 0;
+                /* Copia entre buckets locales usando un pipe, sin malloc. */
+                int res = copiarEntreLocalBuckets(arg1, arg2, arg3, arg4);
 
-                int res = descargarArchivo(arg1, arg2, &datos, &tamDatos);
-                if (res != BUCKET_OK) {
-                    enviarRespuesta(cliente, "ERROR: Archivo origen no encontrado\n");
-                    continue;
-                }
-
-                res = subirArchivo(arg3, arg4, datos, tamDatos);
-                free(datos);
-
-                if (res == BUCKET_OK) enviarRespuesta(cliente, "OK\n");
-                else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Bucket destino no encontrado\n");
-                else if (res == BUCKET_LLENO) enviarRespuesta(cliente, "ERROR: Bucket lleno\n");
-                else enviarRespuesta(cliente, "ERROR: No se pudo copiar\n");
+                if (res == BUCKET_OK)                 enviarRespuesta(cliente, "OK\n");
+                else if (res == BUCKET_NO_ENCONTRADO) enviarRespuesta(cliente, "ERROR: Archivo o bucket no encontrado\n");
+                else if (res == BUCKET_LLENO)         enviarRespuesta(cliente, "ERROR: Bucket lleno\n");
+                else                                  enviarRespuesta(cliente, "ERROR: No se pudo copiar\n");
             }
             else if (strcmp(cmd, "MV") == 0) {
-                void* datos = NULL;
-                uint32_t tamDatos = 0;
-
-                int res = descargarArchivo(arg1, arg2, &datos, &tamDatos);
+                /* Mover = copiar + eliminar origen. */
+                int res = copiarEntreLocalBuckets(arg1, arg2, arg3, arg4);
                 if (res != BUCKET_OK) {
-                    if (datos) free(datos);
-                    enviarRespuesta(cliente, "ERROR: Archivo origen no encontrado\n");
+                    enviarRespuesta(cliente, "ERROR: No se pudo mover archivo\n");
                     continue;
                 }
-
-                res = subirArchivo(arg3, arg4, datos, tamDatos);
-                if (res != BUCKET_OK) {
-                    free(datos);
-                    enviarRespuesta(cliente, "ERROR: No se pudo copiar destino\n");
-                    continue;
-                }
-                free(datos);
-
                 eliminarArchivo(arg1, arg2, 0);
                 enviarRespuesta(cliente, "OK\n");
             }

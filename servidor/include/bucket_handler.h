@@ -3,8 +3,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MAX_RUTA 256
-#define MAX_ARCHIVOS 100
+#define MAX_RUTA      256
+#define MAX_ARCHIVOS  100
+#define CHUNK_SIZE    4096   /* tamaño del bloque para el stream */
 
 typedef struct {
     char     ruta[MAX_RUTA];
@@ -25,17 +26,28 @@ typedef struct {
 } BloqueDirectorio;
 
 typedef enum {
-    BUCKET_OK = 0,
-    BUCKET_YA_EXISTE = -1,
-    BUCKET_ERROR = -2,
+    BUCKET_OK            =  0,
+    BUCKET_YA_EXISTE     = -1,
+    BUCKET_ERROR         = -2,
     BUCKET_NO_ENCONTRADO = -3,
-    BUCKET_LLENO = -4
+    BUCKET_LLENO         = -4
 } EstadoBucket;
 
-int crearBucket(const char* nombre);
-int existeBucket(const char* nombre);
-int subirArchivo(const char* bucket, const char* clave, const void* datos, uint32_t tamano);
-int descargarArchivo(const char* bucket, const char* clave, void** datos, uint32_t* tamano);
-int eliminarArchivo(const char* bucket, const char* clave, int recursivo);
+/* ---------- operaciones de bucket ---------- */
+int crearBucket   (const char* nombre);
+int existeBucket  (const char* nombre);
 int eliminarBucket(const char* nombre, int forzar);
-int listarContenido(const char* bucket, const char* prefijo, char* salida, size_t* tamSalida);
+
+/* ---------- operaciones de archivo (stream) ---------- */
+int subirArchivoStream    (const char* bucket, const char* clave,
+                           int fd_origen,  uint32_t tamano);
+
+int descargarArchivoStream(const char* bucket, const char* clave,
+                           int fd_destino, uint32_t* tamano);
+
+/* ---------- otras operaciones ---------- */
+int eliminarArchivo(const char* bucket, const char* clave, int recursivo);
+int listarContenido(const char* bucket, const char* prefijo,
+                    char* salida, size_t* tamSalida);
+int obtenerTamanoArchivo(const char* bucket, const char* clave,
+                         uint32_t* tamano);
