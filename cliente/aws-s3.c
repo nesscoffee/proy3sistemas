@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -118,6 +119,106 @@ static int leerListado(int fd, char archivos[][TAM_BUF], uint32_t* tamanos, uint
     return 0;
 }
 
+static int enviarComandoSimple(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char cmd[TAM_BUF];
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+
+    int sock = conectarServidor();
+    if (sock < 0) return 1;
+
+    enviarTodo(sock, cmd, strlen(cmd));
+
+    char resp[TAM_BUF];
+    leerLinea(sock, resp, sizeof(resp));
+    printf("%s\n", resp);
+
+    close(sock);
+    return (strncmp(resp, "OK", 2) == 0) ? 0 : 1;
+}
+
+/* Sube archivo local al servidor usando los streams */
+static int subirArchivoLocalAS3(const char* rutaLocal, const char* bucket,
+                                const char* clave, long tamArch) {
+    FILE* f = fopen(rutaLocal, "rb");
+    if (!f) { perror(rutaLocal); return 1; }
+
+    int sock = conectarServidor();
+    if (sock < 0) { fclose(f); return 1; }
+
+    char cmd[TAM_BUF];
+    snprintf(cmd, sizeof(cmd), "PUT %s %s %ld\n", bucket, clave, tamArch);
+    enviarTodo(sock, cmd, strlen(cmd));
+
+    char chunk[TAM_BUF];
+    size_t leido;
+    int error = 0;
+    while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        if (enviarTodo(sock, chunk, leido) < 0) { error = 1; break; }
+    }
+    fclose(f);
+
+    if (error) { fprintf(stderr, "Error: fallo de red durante subida\n"); close(sock); return 1; }
+
+    char resp[TAM_BUF];
+    leerLinea(sock, resp, sizeof(resp));
+    printf("%s\n", resp);
+
+    close(sock);
+    return (strncmp(resp, "OK", 2) == 0) ? 0 : 1;
+}
+
+/* Descarga archivo del servidor al local usando los streams */
+static int descargarArchivoS3ALocal(const char* bucket, const char* clave,
+                                    const char* rutaLocal) {
+    int sock = conectarServidor();
+    if (sock < 0) return 1;
+
+    char cmd[TAM_BUF];
+    snprintf(cmd, sizeof(cmd), "GET %s %s\n", bucket, clave);
+    enviarTodo(sock, cmd, strlen(cmd));
+
+    char resp[TAM_BUF];
+    leerLinea(sock, resp, sizeof(resp));
+    if (strncmp(resp, "OK", 2) != 0) {
+        printf("%s\n", resp);
+        close(sock);
+        return 1;
+    }
+
+    uint32_t tamDatos = (uint32_t)atol(resp + 3);
+
+    /* Crear directorios padres */
+    for (char* p = (char*)rutaLocal + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(rutaLocal, 0755); *p = '/'; }
+    }
+
+    FILE* f = fopen(rutaLocal, "wb");
+    if (!f) { perror(rutaLocal); close(sock); return 1; }
+
+    char chunk[TAM_BUF];
+    uint32_t pendiente = tamDatos;
+    int error = 0;
+    while (pendiente > 0) {
+        uint32_t bloque = (pendiente < TAM_BUF) ? pendiente : TAM_BUF;
+        int r = (int)read(sock, chunk, bloque);
+        if (r <= 0) { error = 1; break; }
+        if (fwrite(chunk, 1, (size_t)r, f) != (size_t)r) { error = 1; break; }
+        pendiente -= (uint32_t)r;
+    }
+    fclose(f);
+    close(sock);
+
+    if (error) {
+        fprintf(stderr, "Error: transferencia incompleta\n");
+        remove(rutaLocal);
+        return 1;
+    }
+    return 0;
+}
+
 static int lsCmd(int argc, char* argv[]) {
     int indiceArgs[2], nArgs = 0;
 
@@ -151,20 +252,7 @@ static int lsCmd(int argc, char* argv[]) {
 
 static int mbCmd(int argc, char* argv[]) {
     if (argc < 3) { fprintf(stderr, "Uso: %s mb <bucket>\n", argv[0]); return 1; }
-
-    int sock = conectarServidor();
-    if (sock < 0) return 1;
-
-    char cmd[TAM_BUF];
-    snprintf(cmd, sizeof(cmd), "CR %s\n", argv[2]);
-    enviarTodo(sock, cmd, strlen(cmd));
-
-    char resp[TAM_BUF];
-    leerLinea(sock, resp, sizeof(resp));
-    printf("%s\n", resp);
-
-    close(sock);
-    return 0;
+    return enviarComandoSimple("CR %s\n", argv[2]);
 }
 
 static int rbCmd(int argc, char* argv[]) {
@@ -174,23 +262,9 @@ static int rbCmd(int argc, char* argv[]) {
     for (int i = 3; i < argc; i++)
         if (strcmp(argv[i], "--force") == 0) flagForce = 1;
 
-    int sock = conectarServidor();
-    if (sock < 0) return 1;
-
-    char cmd[TAM_BUF];
-    if (flagForce)
-        snprintf(cmd, sizeof(cmd), "RB %s FORCE\n", argv[2]);
-    else
-        snprintf(cmd, sizeof(cmd), "RB %s\n", argv[2]);
-
-    enviarTodo(sock, cmd, strlen(cmd));
-
-    char resp[TAM_BUF];
-    leerLinea(sock, resp, sizeof(resp));
-    printf("%s\n", resp);
-
-    close(sock);
-    return 0;
+    return flagForce
+        ? enviarComandoSimple("RB %s FORCE\n", argv[2])
+        : enviarComandoSimple("RB %s\n", argv[2]);
 }
 
 static int cpCmd(int argc, char* argv[]) {
@@ -200,110 +274,33 @@ static int cpCmd(int argc, char* argv[]) {
     int esS3Dest = esRutaS3(argv[3]);
 
     if (esS3Orig && esS3Dest) {
-        int sock = conectarServidor();
-        if (sock < 0) return 1;
-
         char bOrig[TAM_BUF], cOrig[TAM_BUF], bDest[TAM_BUF], cDest[TAM_BUF];
         parsearRutaS3(argv[2], bOrig, sizeof(bOrig), cOrig, sizeof(cOrig));
         parsearRutaS3(argv[3], bDest, sizeof(bDest), cDest, sizeof(cDest));
-
-        char cmd[TAM_BUF];
-        snprintf(cmd, sizeof(cmd), "CP %s %s %s %s\n", bOrig, cOrig, bDest, cDest);
-        enviarTodo(sock, cmd, strlen(cmd));
-
-        char resp[TAM_BUF];
-        leerLinea(sock, resp, sizeof(resp));
-        printf("%s\n", resp);
-        close(sock);
+        return enviarComandoSimple("CP %s %s %s %s\n", bOrig, cOrig, bDest, cDest);
     }
-    else if (!esS3Orig && esS3Dest) {
-        // Upload local -> S3  (streaming: no carga el archivo entero en memoria)
+
+    if (!esS3Orig && esS3Dest) {
         struct stat st;
         if (stat(argv[2], &st) != 0) { perror(argv[2]); return 1; }
-        long tam = st.st_size;
-
-        FILE* f = fopen(argv[2], "rb");
-        if (!f) { perror(argv[2]); return 1; }
 
         char bucket[TAM_BUF], clave[TAM_BUF];
         parsearRutaS3(argv[3], bucket, sizeof(bucket), clave, sizeof(clave));
 
-        int sock = conectarServidor();
-        if (sock < 0) { fclose(f); return 1; }
-
-        /* Enviar cabecera */
-        char cmd[TAM_BUF];
-        snprintf(cmd, sizeof(cmd), "PUT %s %s %ld\n", bucket, clave, tam);
-        enviarTodo(sock, cmd, strlen(cmd));
-
-        /* Enviar cuerpo en chunks */
-        char chunk[TAM_BUF];
-        size_t leido;
-        while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-            if (enviarTodo(sock, chunk, leido) < 0) {
-                fprintf(stderr, "Error enviando datos\n");
-                fclose(f); close(sock); return 1;
-            }
-        }
-        fclose(f);
-
-        char resp[TAM_BUF];
-        leerLinea(sock, resp, sizeof(resp));
-        printf("%s\n", resp);
-        close(sock);
+        return subirArchivoLocalAS3(argv[2], bucket, clave, (long)st.st_size);
     }
-    else if (esS3Orig && !esS3Dest) {
-        // Download S3 -> local
+
+    if (esS3Orig && !esS3Dest) {
         char bucket[TAM_BUF], clave[TAM_BUF];
         parsearRutaS3(argv[2], bucket, sizeof(bucket), clave, sizeof(clave));
 
-        int sock = conectarServidor();
-        if (sock < 0) return 1;
-
-        char cmd[TAM_BUF];
-        snprintf(cmd, sizeof(cmd), "GET %s %s\n", bucket, clave);
-        enviarTodo(sock, cmd, strlen(cmd));
-
-        char resp[TAM_BUF];
-        leerLinea(sock, resp, sizeof(resp));
-        if (strncmp(resp, "OK", 2) != 0) {
-            printf("%s\n", resp);
-            close(sock);
-            return 1;
-        }
-
-        // Descargar en streaming: escribir directamente al archivo de destino
-        uint32_t tamDatos = (uint32_t)atol(resp + 3);
-
-        FILE* f = fopen(argv[3], "wb");
-        if (!f) { perror(argv[3]); close(sock); return 1; }
-
-        char chunk[TAM_BUF];
-        uint32_t pendiente = tamDatos;
-        int errorStream = 0;
-        while (pendiente > 0) {
-            uint32_t bloque = (pendiente < TAM_BUF) ? pendiente : TAM_BUF;
-            int r = (int)read(sock, chunk, bloque);
-            if (r <= 0) { errorStream = 1; break; }
-            if (fwrite(chunk, 1, (size_t)r, f) != (size_t)r) { errorStream = 1; break; }
-            pendiente -= (uint32_t)r;
-        }
-        fclose(f);
-        close(sock);
-
-        if (errorStream) {
-            fprintf(stderr, "Error: transferencia incompleta\n");
-            remove(argv[3]);   /* eliminar archivo parcial */
-            return 1;
-        }
-        printf("OK\n");
-    }
-    else {
-        fprintf(stderr, "Error: al menos uno debe ser ruta S3 (bucket:clave)\n");
-        return 1;
+        int ok = descargarArchivoS3ALocal(bucket, clave, argv[3]);
+        if (ok == 0) printf("OK\n");
+        return ok;
     }
 
-    return 0;
+    fprintf(stderr, "Error: al menos uno debe ser ruta S3 (bucket:clave)\n");
+    return 1;
 }
 
 static int mvCmd(int argc, char* argv[]) {
@@ -314,23 +311,11 @@ static int mvCmd(int argc, char* argv[]) {
         return 1;
     }
 
-    int sock = conectarServidor();
-    if (sock < 0) return 1;
-
     char bOrig[TAM_BUF], cOrig[TAM_BUF], bDest[TAM_BUF], cDest[TAM_BUF];
     parsearRutaS3(argv[2], bOrig, sizeof(bOrig), cOrig, sizeof(cOrig));
     parsearRutaS3(argv[3], bDest, sizeof(bDest), cDest, sizeof(cDest));
 
-    char cmd[TAM_BUF];
-    snprintf(cmd, sizeof(cmd), "MV %s %s %s %s\n", bOrig, cOrig, bDest, cDest);
-    enviarTodo(sock, cmd, strlen(cmd));
-
-    char resp[TAM_BUF];
-    leerLinea(sock, resp, sizeof(resp));
-    printf("%s\n", resp);
-
-    close(sock);
-    return 0;
+    return enviarComandoSimple("MV %s %s %s %s\n", bOrig, cOrig, bDest, cDest);
 }
 
 static int rmCmd(int argc, char* argv[]) {
@@ -341,22 +326,172 @@ static int rmCmd(int argc, char* argv[]) {
     for (int i = 4; i < argc; i++)
         if (strcmp(argv[i], "--recursive") == 0) flagrecursive = 1;
 
-    int sock = conectarServidor();
-    if (sock < 0) return 1;
+    return flagrecursive
+        ? enviarComandoSimple("RM %s %s RECURSIVE\n", argv[2], argv[3])
+        : enviarComandoSimple("RM %s %s\n", argv[2], argv[3]);
+}
 
-    char cmd[TAM_BUF];
-    if (flagrecursive)
-        snprintf(cmd, sizeof(cmd), "RM %s %s recursive\n", argv[2], argv[3]);
-    else
-        snprintf(cmd, sizeof(cmd), "RM %s %s\n", argv[2], argv[3]);
+/* Sincronización upload: local → S3.
+ * Recorre el directorio local, lista el bucket, sube archivos faltantes o
+ * modificados y, si flagDelete está activo, elimina los remotos huérfanos. */
+static int syncUpload(const char* dirLocal, const char* bucket,
+                      const char* prefijo, int flagDelete, int sock) {
+    char (*archivosLocales)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
+    uint32_t* tamanosLocales = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
+    uint32_t nLocales = 0;
 
-    enviarTodo(sock, cmd, strlen(cmd));
+    caminarDirectorio(dirLocal, "", archivosLocales, tamanosLocales, &nLocales, MAX_ARCHIVOS_LOCALES);
 
-    char resp[TAM_BUF];
-    leerLinea(sock, resp, sizeof(resp));
-    printf("%s\n", resp);
+    char cmdLs[TAM_BUF];
+    snprintf(cmdLs, sizeof(cmdLs), "LS %s %s\n", bucket, prefijo);
+    enviarTodo(sock, cmdLs, strlen(cmdLs));
 
-    close(sock);
+    char (*archivosRemotos)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
+    uint32_t* tamanosRemotos = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
+    uint32_t nRemotos = 0;
+    leerListado(sock, archivosRemotos, tamanosRemotos, &nRemotos);
+
+    for (uint32_t i = 0; i < nLocales; i++) {
+        char claveS3[TAM_BUF];
+        snprintf(claveS3, sizeof(claveS3), "%s%s", prefijo, archivosLocales[i]);
+
+        int encontrado = 0;
+        for (uint32_t j = 0; j < nRemotos; j++) {
+            if (strcmp(archivosRemotos[j], claveS3) == 0 &&
+                tamanosRemotos[j] == tamanosLocales[i]) {
+                encontrado = 1;
+                break;
+            }
+        }
+
+        if (!encontrado) {
+            char rutaLocal[4096];
+            snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", dirLocal, archivosLocales[i]);
+
+            struct stat stArch;
+            if (stat(rutaLocal, &stArch) != 0) continue;
+
+            FILE* f = fopen(rutaLocal, "rb");
+            if (!f) continue;
+
+            char cmdPut[TAM_BUF];
+            snprintf(cmdPut, sizeof(cmdPut), "PUT %s %s %ld\n", bucket, claveS3, (long)stArch.st_size);
+            enviarTodo(sock, cmdPut, strlen(cmdPut));
+
+            char chunk[TAM_BUF];
+            size_t leido;
+            int errorUp = 0;
+            while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+                if (enviarTodo(sock, chunk, leido) < 0) { errorUp = 1; break; }
+            }
+            fclose(f);
+
+            if (errorUp) { printf("ERROR %s: fallo de red\n", claveS3); continue; }
+
+            char resp[TAM_BUF];
+            leerLinea(sock, resp, sizeof(resp));
+            if (strncmp(resp, "OK", 2) == 0)
+                printf("SUBIDO %s\n", claveS3);
+            else
+                printf("ERROR %s: %s\n", claveS3, resp);
+        }
+    }
+
+    if (flagDelete) {
+        for (uint32_t j = 0; j < nRemotos; j++) {
+            const char* rutaRel = archivosRemotos[j] + strlen(prefijo);
+            int encontrado = 0;
+            for (uint32_t i = 0; i < nLocales; i++) {
+                if (strcmp(archivosLocales[i], rutaRel) == 0) { encontrado = 1; break; }
+            }
+            if (!encontrado) {
+                char cmdRm[TAM_BUF];
+                snprintf(cmdRm, sizeof(cmdRm), "RM %s %s\n", bucket, archivosRemotos[j]);
+                enviarTodo(sock, cmdRm, strlen(cmdRm));
+                char resp[TAM_BUF];
+                leerLinea(sock, resp, sizeof(resp));
+                if (strncmp(resp, "OK", 2) == 0)
+                    printf("ELIMINADO %s\n", archivosRemotos[j]);
+            }
+        }
+    }
+
+    free(archivosLocales);
+    free(tamanosLocales);
+    free(archivosRemotos);
+    free(tamanosRemotos);
+    return 0;
+}
+
+/* Sincronización download: S3 → local.
+ * Lista el bucket, descarga archivos faltantes o modificados y, si
+ * flagDelete está activo, elimina los locales huérfanos. */
+static int syncDownload(const char* bucket, const char* prefijo,
+                        const char* dirLocal, int flagDelete, int sock) {
+    char cmdLs[TAM_BUF];
+    snprintf(cmdLs, sizeof(cmdLs), "LS %s %s\n", bucket, prefijo);
+    enviarTodo(sock, cmdLs, strlen(cmdLs));
+
+    char (*archivosRemotos)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
+    uint32_t* tamanosRemotos = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
+    uint32_t nRemotos = 0;
+    leerListado(sock, archivosRemotos, tamanosRemotos, &nRemotos);
+
+    char (*archivosLocales)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
+    uint32_t* tamanosLocales = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
+    uint32_t nLocales = 0;
+
+    struct stat stBase;
+    if (stat(dirLocal, &stBase) == 0 && S_ISDIR(stBase.st_mode))
+        caminarDirectorio(dirLocal, "", archivosLocales, tamanosLocales, &nLocales, MAX_ARCHIVOS_LOCALES);
+
+    size_t longPrefijo = strlen(prefijo);
+
+    for (uint32_t j = 0; j < nRemotos; j++) {
+        const char* rutaRel = archivosRemotos[j] + longPrefijo;
+        if (*rutaRel == '/') rutaRel++;
+
+        char rutaLocal[4096];
+        snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", dirLocal, rutaRel);
+
+        int descargar = 1;
+        for (uint32_t i = 0; i < nLocales; i++) {
+            if (strcmp(archivosLocales[i], rutaRel) == 0 &&
+                tamanosLocales[i] == tamanosRemotos[j]) {
+                descargar = 0;
+                break;
+            }
+        }
+
+        if (descargar) {
+            int ok = descargarArchivoS3ALocal(bucket, archivosRemotos[j], rutaLocal);
+            if (ok == 0)
+                printf("DESCARGADO %s\n", archivosRemotos[j]);
+            else
+                printf("ERROR %s: fallo de descarga\n", archivosRemotos[j]);
+        }
+    }
+
+    if (flagDelete) {
+        for (uint32_t i = 0; i < nLocales; i++) {
+            int encontrado = 0;
+            for (uint32_t j = 0; j < nRemotos; j++) {
+                const char* rutaRel = archivosRemotos[j] + longPrefijo;
+                if (*rutaRel == '/') rutaRel++;
+                if (strcmp(archivosLocales[i], rutaRel) == 0) { encontrado = 1; break; }
+            }
+            if (!encontrado) {
+                char rutaLocal[4096];
+                snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", dirLocal, archivosLocales[i]);
+                if (remove(rutaLocal) == 0) printf("ELIMINADO_LOCAL %s\n", rutaLocal);
+            }
+        }
+    }
+
+    free(archivosLocales);
+    free(tamanosLocales);
+    free(archivosRemotos);
+    free(tamanosRemotos);
     return 0;
 }
 
@@ -373,7 +508,6 @@ static int syncCmd(int argc, char* argv[]) {
     int esS3Orig = esRutaS3(argv[2]);
     int esS3Dest = esRutaS3(argv[3]);
 
-    // Ensure exactly one S3 path
     if (esS3Orig == esS3Dest) {
         fprintf(stderr, "Error: uno debe ser directorio local y el otro ruta S3\n");
         return 1;
@@ -383,206 +517,13 @@ static int syncCmd(int argc, char* argv[]) {
     if (sock < 0) return 1;
 
     if (!esS3Orig && esS3Dest) {
-        // Upload sync: local -> S3
         char bucket[TAM_BUF], prefijo[TAM_BUF];
         parsearRutaS3(argv[3], bucket, sizeof(bucket), prefijo, sizeof(prefijo));
-
-        // Walk local directory
-        char (*archivosLocales)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
-        uint32_t* tamanosLocales = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
-        uint32_t nLocales = 0;
-
-        caminarDirectorio(argv[2], "", archivosLocales, tamanosLocales, &nLocales, MAX_ARCHIVOS_LOCALES);
-
-        // Get remote listing
-        char cmdLs[TAM_BUF];
-        snprintf(cmdLs, sizeof(cmdLs), "LS %s %s\n", bucket, prefijo);
-        enviarTodo(sock, cmdLs, strlen(cmdLs));
-
-        char (*archivosRemotos)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
-        uint32_t* tamanosRemotos = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
-        uint32_t nRemotos = 0;
-        leerListado(sock, archivosRemotos, tamanosRemotos, &nRemotos);
-
-        // Upload missing or changed files
-        for (uint32_t i = 0; i < nLocales; i++) {
-            char claveS3[TAM_BUF];
-            snprintf(claveS3, sizeof(claveS3), "%s%s", prefijo, archivosLocales[i]);
-
-            int encontrado = 0;
-            for (uint32_t j = 0; j < nRemotos; j++) {
-                if (strcmp(archivosRemotos[j], claveS3) == 0 &&
-                    tamanosRemotos[j] == tamanosLocales[i]) {
-                    encontrado = 1;
-                    break;
-                }
-            }
-
-            if (!encontrado) {
-                // Read local file and stream it
-                char rutaLocal[4096];
-                snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", argv[2], archivosLocales[i]);
-
-                struct stat stArch;
-                if (stat(rutaLocal, &stArch) != 0) continue;
-                long tamArch = stArch.st_size;
-
-                FILE* f = fopen(rutaLocal, "rb");
-                if (!f) continue;
-
-                // Send PUT header
-                char cmdPut[TAM_BUF];
-                snprintf(cmdPut, sizeof(cmdPut), "PUT %s %s %ld\n", bucket, claveS3, tamArch);
-                enviarTodo(sock, cmdPut, strlen(cmdPut));
-
-                // Stream body in chunks
-                char chunk[TAM_BUF];
-                size_t leido;
-                int errorUp = 0;
-                while ((leido = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-                    if (enviarTodo(sock, chunk, leido) < 0) { errorUp = 1; break; }
-                }
-                fclose(f);
-
-                if (errorUp) { printf("ERROR %s: fallo de red\n", claveS3); continue; }
-
-                char resp[TAM_BUF];
-                leerLinea(sock, resp, sizeof(resp));
-                if (strncmp(resp, "OK", 2) == 0)
-                    printf("SUBIDO %s\n", claveS3);
-                else
-                    printf("ERROR %s: %s\n", claveS3, resp);
-            }
-        }
-
-        // Delete remote files not in local
-        if (flagDelete) {
-            for (uint32_t j = 0; j < nRemotos; j++) {
-                const char* rutaRel = archivosRemotos[j] + strlen(prefijo);
-                int encontrado = 0;
-                for (uint32_t i = 0; i < nLocales; i++) {
-                    if (strcmp(archivosLocales[i], rutaRel) == 0) { encontrado = 1; break; }
-                }
-                if (!encontrado) {
-                    char cmdRm[TAM_BUF];
-                    snprintf(cmdRm, sizeof(cmdRm), "RM %s %s\n", bucket, archivosRemotos[j]);
-                    enviarTodo(sock, cmdRm, strlen(cmdRm));
-                    char resp[TAM_BUF];
-                    leerLinea(sock, resp, sizeof(resp));
-                    if (strncmp(resp, "OK", 2) == 0)
-                        printf("ELIMINADO %s\n", archivosRemotos[j]);
-                }
-            }
-        }
-
-        free(archivosLocales);
-        free(tamanosLocales);
-        free(archivosRemotos);
-        free(tamanosRemotos);
-    }
-    else {
-        // Download sync: S3 -> local
+        syncUpload(argv[2], bucket, prefijo, flagDelete, sock);
+    } else {
         char bucket[TAM_BUF], prefijo[TAM_BUF];
         parsearRutaS3(argv[2], bucket, sizeof(bucket), prefijo, sizeof(prefijo));
-
-        // Get remote listing
-        char cmdLs[TAM_BUF];
-        snprintf(cmdLs, sizeof(cmdLs), "LS %s %s\n", bucket, prefijo);
-        enviarTodo(sock, cmdLs, strlen(cmdLs));
-
-        char (*archivosRemotos)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
-        uint32_t* tamanosRemotos = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
-        uint32_t nRemotos = 0;
-        leerListado(sock, archivosRemotos, tamanosRemotos, &nRemotos);
-
-        // Walk local to know existing files
-        char (*archivosLocales)[TAM_BUF] = malloc(MAX_ARCHIVOS_LOCALES * TAM_BUF);
-        uint32_t* tamanosLocales = malloc(MAX_ARCHIVOS_LOCALES * sizeof(uint32_t));
-        uint32_t nLocales = 0;
-
-        struct stat stBase;
-        if (stat(argv[3], &stBase) == 0 && S_ISDIR(stBase.st_mode))
-            caminarDirectorio(argv[3], "", archivosLocales, tamanosLocales, &nLocales, MAX_ARCHIVOS_LOCALES);
-
-        // Download missing or changed files
-        size_t longPrefijo = strlen(prefijo);
-
-        for (uint32_t j = 0; j < nRemotos; j++) {
-            const char* rutaRel = archivosRemotos[j] + longPrefijo;
-            if (*rutaRel == '/') rutaRel++;
-
-            char rutaLocal[4096];
-            snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", argv[3], rutaRel);
-
-            int descargar = 1;
-            for (uint32_t i = 0; i < nLocales; i++) {
-                if (strcmp(archivosLocales[i], rutaRel) == 0 &&
-                    tamanosLocales[i] == tamanosRemotos[j]) {
-                    descargar = 0;
-                    break;
-                }
-            }
-
-            if (descargar) {
-                char cmdGet[TAM_BUF];
-                snprintf(cmdGet, sizeof(cmdGet), "GET %s %s\n", bucket, archivosRemotos[j]);
-                enviarTodo(sock, cmdGet, strlen(cmdGet));
-
-                char resp[TAM_BUF];
-                leerLinea(sock, resp, sizeof(resp));
-                if (strncmp(resp, "OK", 2) != 0) {
-                    printf("ERROR %s: %s\n", archivosRemotos[j], resp);
-                    continue;
-                }
-
-                uint32_t tamDatos = (uint32_t)atol(resp + 3);
-
-                // Create parent directories
-                for (char* p = rutaLocal + 1; *p; p++) {
-                    if (*p == '/') { *p = '\0'; mkdir(rutaLocal, 0755); *p = '/'; }
-                }
-
-                FILE* f = fopen(rutaLocal, "wb");
-                if (!f) continue;
-
-                char chunk[TAM_BUF];
-                uint32_t pendiente = tamDatos;
-                int errorDown = 0;
-                while (pendiente > 0) {
-                    uint32_t bloque = (pendiente < TAM_BUF) ? pendiente : TAM_BUF;
-                    int r = (int)read(sock, chunk, bloque);
-                    if (r <= 0) { errorDown = 1; break; }
-                    fwrite(chunk, 1, (size_t)r, f);
-                    pendiente -= (uint32_t)r;
-                }
-                fclose(f);
-
-                if (errorDown) { remove(rutaLocal); continue; }
-                printf("DESCARGADO %s\n", archivosRemotos[j]);
-            }
-        }
-
-        // Delete local files not in remote
-        if (flagDelete) {
-            for (uint32_t i = 0; i < nLocales; i++) {
-                int encontrado = 0;
-                for (uint32_t j = 0; j < nRemotos; j++) {
-                    const char* rutaRel = archivosRemotos[j] + longPrefijo;
-                    if (*rutaRel == '/') rutaRel++;
-                    if (strcmp(archivosLocales[i], rutaRel) == 0) { encontrado = 1; break; }
-                }
-                if (!encontrado) {
-                    char rutaLocal[4096];
-                    snprintf(rutaLocal, sizeof(rutaLocal), "%s/%s", argv[3], archivosLocales[i]);
-                    if (remove(rutaLocal) == 0) printf("ELIMINADO_LOCAL %s\n", rutaLocal);
-                }
-            }
-        }
-
-        free(archivosLocales);
-        free(tamanosLocales);
-        free(archivosRemotos);
-        free(tamanosRemotos);
+        syncDownload(bucket, prefijo, argv[3], flagDelete, sock);
     }
 
     close(sock);

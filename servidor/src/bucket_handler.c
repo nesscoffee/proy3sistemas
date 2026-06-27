@@ -1,4 +1,4 @@
-#include "bucket_handler.h"
+#include "../include/bucket_handler.h"
 
 #include <errno.h>
 #include <sys/stat.h>
@@ -9,12 +9,11 @@
 #include <unistd.h>
 
 /* ============================================================
- * Utilidades internas
+ * Utilidades
  * ============================================================ */
 
 /* Ordena y fusiona huecos contiguos en la lista de espacios libres. */
 static void mergeHuecos(EspacioLibre* huecos, uint32_t* n) {
-    /* Ordenar por offset (burbuja simple; n ≤ MAX_ARCHIVOS = 100) */
     for (uint32_t i = 0; i < *n; i++) {
         for (uint32_t j = i + 1; j < *n; j++) {
             if (huecos[j].offset < huecos[i].offset) {
@@ -41,9 +40,22 @@ static void mergeHuecos(EspacioLibre* huecos, uint32_t* n) {
     *n = w;
 }
 
-/* Devuelve la ruta al archivo de bucket en `ruta` (buffer de MAX_RUTA bytes). */
 static void rutaBucket(const char* nombre, char* ruta) {
     snprintf(ruta, MAX_RUTA, "buckets/%s", nombre);
+}
+
+// forward declaration para definir antes de su uso
+static int leerDirectorio(FILE* arch, BloqueDirectorio* dir);
+static int escribirDirectorio(FILE* arch, const BloqueDirectorio* dir);
+
+/* Abre un bucket en modo `modo` y lo devuelve en `*dir`. Retorna el FILE* o NULL. */
+static FILE* abrirBucket(const char* nombre, const char* modo, BloqueDirectorio* dir) {
+    char ruta[MAX_RUTA];
+    rutaBucket(nombre, ruta);
+    FILE* arch = fopen(ruta, modo);
+    if (!arch) return NULL;
+    if (leerDirectorio(arch, dir) < 0) { fclose(arch); return NULL; }
+    return arch;
 }
 
 /* Lee exactamente `n` bytes del descriptor `fd` al buffer `buf`.
@@ -66,6 +78,34 @@ static int escribirExacto(int fd, const void* buf, size_t n) {
         ssize_t r = write(fd, (const char*)buf + enviado, n - enviado);
         if (r <= 0) return -1;
         enviado += (size_t)r;
+    }
+    return 0;
+}
+
+/* Escribe `tamano` bytes desde fd_origen al archivo FILE* en chunks de CHUNK_SIZE.
+ * Retorna 0 en éxito, -1 en error. */
+static int streamFromFdToFile(int fd_origen, FILE* arch, uint32_t tamano) {
+    char chunk[CHUNK_SIZE];
+    uint32_t pendiente = tamano;
+    while (pendiente > 0) {
+        uint32_t bloque = (pendiente < CHUNK_SIZE) ? pendiente : CHUNK_SIZE;
+        if (leerExacto(fd_origen, chunk, bloque) < 0) return -1;
+        if (fwrite(chunk, 1, bloque, arch) != bloque) return -1;
+        pendiente -= bloque;
+    }
+    return 0;
+}
+
+/* Lee `tamano` bytes del archivo FILE* y los escribe en fd_destino en chunks.
+ * Retorna 0 en éxito, -1 en error. */
+static int streamFromFileToFd(FILE* arch, int fd_destino, uint32_t tamano) {
+    char chunk[CHUNK_SIZE];
+    uint32_t pendiente = tamano;
+    while (pendiente > 0) {
+        uint32_t bloque = (pendiente < CHUNK_SIZE) ? pendiente : CHUNK_SIZE;
+        if (fread(chunk, 1, bloque, arch) != bloque) return -1;
+        if (escribirExacto(fd_destino, chunk, bloque) < 0) return -1;
+        pendiente -= bloque;
     }
     return 0;
 }
@@ -132,7 +172,7 @@ static int escribirDirectorio(FILE* arch, const BloqueDirectorio* dir) {
     return (fwrite(dir, sizeof(*dir), 1, arch) == 1) ? 0 : -1;
 }
 
-/* Busca `clave` en el directorio; retorna su índice o -1 si no existe. */
+/* Busca `clave` en el directorio */
 static int buscarArchivo(const BloqueDirectorio* dir, const char* clave) {
     for (uint32_t i = 0; i < dir->cantidadArchivos; i++)
         if (strcmp(dir->archivos[i].ruta, clave) == 0)
@@ -140,14 +180,13 @@ static int buscarArchivo(const BloqueDirectorio* dir, const char* clave) {
     return -1;
 }
 
-/* Elimina la entrada en el índice `idx` y registra su espacio como libre. */
 static void liberarEntrada(BloqueDirectorio* dir, uint32_t idx) {
     if (dir->cantidadHuecos < MAX_ARCHIVOS) {
         dir->espaciosLibres[dir->cantidadHuecos].offset = dir->archivos[idx].offset;
         dir->espaciosLibres[dir->cantidadHuecos].tamano = dir->archivos[idx].tamano;
         dir->cantidadHuecos++;
     }
-    /* Compactar el arreglo de metadatos */
+    /* compacta el array de metadatos */
     for (uint32_t i = idx; i < dir->cantidadArchivos - 1; i++)
         dir->archivos[i] = dir->archivos[i + 1];
     dir->cantidadArchivos--;
@@ -157,13 +196,11 @@ static void liberarEntrada(BloqueDirectorio* dir, uint32_t idx) {
  * Si lo usa parcialmente deja el resto como hueco nuevo.
  * Retorna el offset donde se debe escribir el nuevo contenido. */
 static uint32_t asignarEspacio(BloqueDirectorio* dir, uint32_t tamano, FILE* arch) {
-    /* Buscar primer hueco suficientemente grande */
     for (uint32_t i = 0; i < dir->cantidadHuecos; i++) {
         if (dir->espaciosLibres[i].tamano >= tamano) {
             uint32_t offset    = dir->espaciosLibres[i].offset;
             uint32_t restante  = dir->espaciosLibres[i].tamano - tamano;
 
-            /* Eliminar el hueco usado */
             for (uint32_t j = i; j < dir->cantidadHuecos - 1; j++)
                 dir->espaciosLibres[j] = dir->espaciosLibres[j + 1];
             dir->cantidadHuecos--;
@@ -184,25 +221,14 @@ static uint32_t asignarEspacio(BloqueDirectorio* dir, uint32_t tamano, FILE* arc
     return (uint32_t)ftell(arch);
 }
 
-/* ============================================================
- * subirArchivoStream
- *
- * Lee `tamano` bytes desde `fd_origen` en bloques de CHUNK_SIZE
- * y los escribe directamente en el archivo de bucket, sin cargar
- * el contenido completo en memoria.
- * ============================================================ */
+// Subir archivo desde un descriptor por medio de un stream
 int subirArchivoStream(const char* bucket, const char* clave,
                        int fd_origen, uint32_t tamano) {
     if (existeBucket(bucket) != 0) return BUCKET_NO_ENCONTRADO;
 
-    char ruta[MAX_RUTA];
-    rutaBucket(bucket, ruta);
-
-    FILE* arch = fopen(ruta, "rb+");
-    if (!arch) return BUCKET_ERROR;
-
     BloqueDirectorio dir;
-    if (leerDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+    FILE* arch = abrirBucket(bucket, "rb+", &dir);
+    if (!arch) return BUCKET_ERROR;
 
     int idx = buscarArchivo(&dir, clave);
 
@@ -212,17 +238,8 @@ int subirArchivoStream(const char* bucket, const char* clave,
         if (meta->tamano == tamano) {
             /* Mismo tamaño → sobreescribir en el mismo lugar */
             fseek(arch, (long)meta->offset, SEEK_SET);
-            char chunk[CHUNK_SIZE];
-            uint32_t pendiente = tamano;
-            while (pendiente > 0) {
-                uint32_t bloque = (pendiente < CHUNK_SIZE) ? pendiente : CHUNK_SIZE;
-                if (leerExacto(fd_origen, chunk, bloque) < 0) {
-                    fclose(arch); return BUCKET_ERROR;
-                }
-                if (fwrite(chunk, 1, bloque, arch) != bloque) {
-                    fclose(arch); return BUCKET_ERROR;
-                }
-                pendiente -= bloque;
+            if (streamFromFdToFile(fd_origen, arch, tamano) < 0) {
+                fclose(arch); return BUCKET_ERROR;
             }
             if (escribirDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
             fclose(arch);
@@ -240,17 +257,8 @@ int subirArchivoStream(const char* bucket, const char* clave,
 
     /* Escribir datos en streaming */
     fseek(arch, (long)offset, SEEK_SET);
-    char chunk[CHUNK_SIZE];
-    uint32_t pendiente = tamano;
-    while (pendiente > 0) {
-        uint32_t bloque = (pendiente < CHUNK_SIZE) ? pendiente : CHUNK_SIZE;
-        if (leerExacto(fd_origen, chunk, bloque) < 0) {
-            fclose(arch); return BUCKET_ERROR;
-        }
-        if (fwrite(chunk, 1, bloque, arch) != bloque) {
-            fclose(arch); return BUCKET_ERROR;
-        }
-        pendiente -= bloque;
+    if (streamFromFdToFile(fd_origen, arch, tamano) < 0) {
+        fclose(arch); return BUCKET_ERROR;
     }
 
     /* Registrar nueva entrada de metadatos */
@@ -265,25 +273,14 @@ int subirArchivoStream(const char* bucket, const char* clave,
     return BUCKET_OK;
 }
 
-/* ============================================================
- * descargarArchivoStream
- *
- * Escribe el contenido del objeto en `fd_destino` en bloques de
- * CHUNK_SIZE bytes, sin almacenar el archivo completo en memoria.
- * Establece *tamano con la cantidad de bytes enviados.
- * ============================================================ */
+// Descargar archivo, tambien por stream.
 int descargarArchivoStream(const char* bucket, const char* clave,
                            int fd_destino, uint32_t* tamano) {
     if (existeBucket(bucket) != 0) return BUCKET_NO_ENCONTRADO;
 
-    char ruta[MAX_RUTA];
-    rutaBucket(bucket, ruta);
-
-    FILE* arch = fopen(ruta, "rb");
-    if (!arch) return BUCKET_ERROR;
-
     BloqueDirectorio dir;
-    if (leerDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+    FILE* arch = abrirBucket(bucket, "rb", &dir);
+    if (!arch) return BUCKET_ERROR;
 
     int idx = buscarArchivo(&dir, clave);
     if (idx < 0) { fclose(arch); return BUCKET_NO_ENCONTRADO; }
@@ -292,38 +289,18 @@ int descargarArchivoStream(const char* bucket, const char* clave,
     *tamano = meta->tamano;
 
     fseek(arch, (long)meta->offset, SEEK_SET);
-
-    char chunk[CHUNK_SIZE];
-    uint32_t pendiente = meta->tamano;
-    while (pendiente > 0) {
-        uint32_t bloque = (pendiente < CHUNK_SIZE) ? pendiente : CHUNK_SIZE;
-        if (fread(chunk, 1, bloque, arch) != bloque) {
-            fclose(arch); return BUCKET_ERROR;
-        }
-        if (escribirExacto(fd_destino, chunk, bloque) < 0) {
-            fclose(arch); return BUCKET_ERROR;
-        }
-        pendiente -= bloque;
-    }
+    int res = streamFromFileToFd(arch, fd_destino, meta->tamano);
 
     fclose(arch);
-    return BUCKET_OK;
+    return (res == 0) ? BUCKET_OK : BUCKET_ERROR;
 }
 
-/* ============================================================
- * eliminarArchivo
- * ============================================================ */
 int eliminarArchivo(const char* bucket, const char* clave, int recursivo) {
     if (existeBucket(bucket) != 0) return BUCKET_NO_ENCONTRADO;
 
-    char ruta[MAX_RUTA];
-    rutaBucket(bucket, ruta);
-
-    FILE* arch = fopen(ruta, "rb+");
-    if (!arch) return BUCKET_ERROR;
-
     BloqueDirectorio dir;
-    if (leerDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+    FILE* arch = abrirBucket(bucket, "rb+", &dir);
+    if (!arch) return BUCKET_ERROR;
 
     size_t   longClave = strlen(clave);
     uint32_t eliminados = 0;
@@ -345,14 +322,11 @@ int eliminarArchivo(const char* bucket, const char* clave, int recursivo) {
 
     mergeHuecos(dir.espaciosLibres, &dir.cantidadHuecos);
 
-    if (escribirDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+    int ok = escribirDirectorio(arch, &dir);
     fclose(arch);
-    return BUCKET_OK;
+    return (ok == 0) ? BUCKET_OK : BUCKET_ERROR;
 }
 
-/* ============================================================
- * listarContenido
- * ============================================================ */
 int listarContenido(const char* bucket, const char* prefijo,
                     char* salida, size_t* tamSalida) {
     size_t pos = 0;
@@ -379,16 +353,9 @@ int listarContenido(const char* bucket, const char* prefijo,
         }
     } else {
         /* Listar objetos dentro de un bucket */
-        if (existeBucket(bucket) != 0) return BUCKET_NO_ENCONTRADO;
-
-        char ruta[MAX_RUTA];
-        rutaBucket(bucket, ruta);
-
-        FILE* arch = fopen(ruta, "rb");
-        if (!arch) return BUCKET_ERROR;
-
         BloqueDirectorio dir;
-        if (leerDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+        FILE* arch = abrirBucket(bucket, "rb", &dir);
+        if (!arch) return BUCKET_NO_ENCONTRADO;
         fclose(arch);
 
         size_t longPrefijo = prefijo ? strlen(prefijo) : 0;
@@ -407,28 +374,19 @@ int listarContenido(const char* bucket, const char* prefijo,
         }
     }
 
-    /* Centinela de fin de listado */
     int n = snprintf(salida + pos, *tamSalida - pos, ".\n");
     if (n > 0) pos += (size_t)n;
     *tamSalida = pos;
     return BUCKET_OK;
 }
 
-/* ============================================================
- * obtenerTamanoArchivo
- * ============================================================ */
 int obtenerTamanoArchivo(const char* bucket, const char* clave,
                          uint32_t* tamano) {
     if (existeBucket(bucket) != 0) return BUCKET_NO_ENCONTRADO;
 
-    char ruta[MAX_RUTA];
-    rutaBucket(bucket, ruta);
-
-    FILE* arch = fopen(ruta, "rb");
-    if (!arch) return BUCKET_ERROR;
-
     BloqueDirectorio dir;
-    if (leerDirectorio(arch, &dir) < 0) { fclose(arch); return BUCKET_ERROR; }
+    FILE* arch = abrirBucket(bucket, "rb", &dir);
+    if (!arch) return BUCKET_ERROR;
     fclose(arch);
 
     int idx = buscarArchivo(&dir, clave);
